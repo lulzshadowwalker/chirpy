@@ -1,9 +1,10 @@
 <html>
-	<body>
-		<h1>Hits: {{ .Hits }}</h1>
+    <body>
+        <h1>Welcome, Chirpy Admin</h1>
+        <p>Chirpy has been visited {{ .Hits }} times!</p>
 
-		<form action="/reset" method="POST">
-			<button>Reset</button>
-		</form>
-	</body>
+        <form action="/admin/reset" method="POST">
+            <button>Reset</button>
+        </form>
+    </body>
 </html>
