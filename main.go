@@ -2,22 +2,47 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"html/template"
 	"log/slog"
 	"net/http"
+	"net/mail"
 	"os"
 	"os/signal"
 	"strings"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unicode/utf8"
+
+	"github.com/google/uuid"
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
+	"github.com/lulzshadowwalker/chirpy/internal/database"
 )
 
 func main() {
+	if err := godotenv.Load(); err != nil {
+		slog.Warn("failed to load .env file", "err", err)
+	}
+
+	db, err := sql.Open("postgres", os.Getenv("DB_URL"))
+	if err != nil {
+		slog.Error("failed to connect to database", "err", err)
+		os.Exit(1)
+	}
+
+	if err := db.Ping(); err != nil {
+		slog.Error("failed to ping database", "err", err)
+		os.Exit(1)
+	}
+
 	mux := http.NewServeMux()
+
 	var state State
+	state.database = database.New(db)
 
 	chain := NewChain(logger, state.hit)
 
@@ -25,8 +50,10 @@ func main() {
 	mux.Handle("/app/", chain.Then(fs))
 
 	mux.HandleFunc("GET /api/healthz", health)
-	mux.HandleFunc("POST /api/validate_chirp", validateChirp)
-	mux.HandleFunc("POST /api/chirps/validate", validateChirp)
+	mux.Handle("POST /api/users", chain.ThenFunc(state.CreateUser))
+	mux.Handle("POST /api/chirps", chain.ThenFunc(state.CreateChirp))
+	mux.Handle("GET /api/chirps", chain.ThenFunc(state.GetChirps))
+	mux.Handle("GET /api/chirps/{id}", chain.ThenFunc(state.GetChirp))
 
 	mux.HandleFunc("GET /admin/metrics", state.Metrics)
 	mux.HandleFunc("POST /admin/reset", state.Reset)
@@ -37,7 +64,7 @@ func main() {
 	}
 
 	go func() {
-		if err := s.ListenAndServe(); err != nil && errors.Is(http.ErrServerClosed, err) {
+		if err := s.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("failed to start server", "err", err)
 		}
 	}()
@@ -94,7 +121,8 @@ func (c Chain) ThenFunc(next http.HandlerFunc) http.Handler {
 }
 
 type State struct {
-	hits atomic.Int32
+	hits     atomic.Int32
+	database *database.Queries
 }
 
 func (s *State) Metrics(w http.ResponseWriter, r *http.Request) {
@@ -124,7 +152,19 @@ func (s *State) hit(next http.Handler) http.Handler {
 }
 
 func (s *State) Reset(w http.ResponseWriter, r *http.Request) {
+	if os.Getenv("APP_ENV") != "local" {
+		w.WriteHeader(403)
+		return
+	}
+
 	s.hits.Store(0)
+
+	if err := s.database.DeleteUsers(r.Context()); err != nil {
+		slog.Error("failed to delete users", "err", err)
+		w.WriteHeader(500)
+		return
+	}
+
 	http.Redirect(w, r, "/admin/metrics", http.StatusSeeOther)
 }
 
@@ -132,25 +172,6 @@ var banned = map[string]struct{}{
 	"kerfuffle": {},
 	"sharbert":  {},
 	"fornax":    {},
-}
-
-func validateChirp(w http.ResponseWriter, r *http.Request) {
-	var params struct {
-		Body string `json:"body"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&params); err != nil {
-		slog.Error("failed to decode body", "err", err)
-		jason(w, 400, map[string]any{"error": "Something went wrong"})
-		return
-	}
-
-	if utf8.RuneCountInString(params.Body) > 140 {
-		jason(w, 400, map[string]any{"error": "Chirp is too long"})
-		return
-	}
-
-	jason(w, 200, map[string]any{"cleaned_body": scrub(params.Body)})
 }
 
 func scrub(s string) string {
@@ -162,6 +183,147 @@ func scrub(s string) string {
 	}
 
 	return strings.Join(words, " ")
+}
+
+type User struct {
+	ID        uuid.UUID `json:"id"`
+	Email     string    `json:"email"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func NewUser(u database.User) User {
+	return User{
+		ID:        u.ID,
+		Email:     u.Email,
+		CreatedAt: u.CreatedAt,
+		UpdatedAt: u.UpdatedAt,
+	}
+}
+
+type Chirp struct {
+	ID        uuid.UUID `json:"id"`
+	Body      string    `json:"email"`
+	UserID    uuid.UUID `json:"user_id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func NewChirp(s string) (*Chirp, error) {
+	if utf8.RuneCountInString(s) > 140 {
+		return nil, errors.New("chirp is too long")
+	}
+
+	return &Chirp{Body: scrub(s)}, nil
+}
+
+func NewChirpFromDB(c database.Chirp) Chirp {
+	return Chirp{
+		ID:        c.ID,
+		Body:      c.Body,
+		UserID:    c.UserID,
+		CreatedAt: c.CreatedAt,
+		UpdatedAt: c.UpdatedAt,
+	}
+}
+
+func (s *State) CreateUser(w http.ResponseWriter, r *http.Request) {
+	var params struct {
+		Email string `json:"email"`
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&params); err != nil {
+		jason(w, 400, map[string]any{"error": "something went wrong"})
+		return
+	}
+
+	if _, err := mail.ParseAddress(params.Email); err != nil {
+		jason(w, 400, map[string]any{"error": "invalid email address"})
+		return
+	}
+
+	u, err := s.database.CreateUser(r.Context(), params.Email)
+	if err != nil {
+		slog.Error("failed to create user", "err", err)
+		w.WriteHeader(500)
+		return
+	}
+
+	jason(w, 201, NewUser(u))
+}
+
+func (s *State) CreateChirp(w http.ResponseWriter, r *http.Request) {
+	var params struct {
+		Body   string `json:"body"`
+		UserID string `json:"user_id"`
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&params); err != nil {
+		jason(w, 400, map[string]any{"error": "something went wrong"})
+		return
+	}
+
+	e, err := NewChirp(params.Body)
+	if err != nil {
+		jason(w, 400, map[string]any{"error": "invalid email address"})
+		return
+	}
+
+	uid, err := uuid.Parse(params.UserID)
+	if err != nil {
+		jason(w, 400, map[string]any{"error": "invalid user id"})
+		return
+	}
+
+	c, err := s.database.CreateChirp(r.Context(), database.CreateChirpParams{Body: e.Body, UserID: uid})
+	if err != nil {
+		slog.Error("failed to create chirp", "err", err)
+		w.WriteHeader(500)
+		return
+	}
+
+	jason(w, 201, NewChirpFromDB(c))
+}
+
+func (s *State) GetChirps(w http.ResponseWriter, r *http.Request) {
+	records, err := s.database.GetChirps(r.Context())
+	if err != nil {
+		slog.Error("failed to get chirps", "err", err)
+		w.WriteHeader(500)
+		return
+	}
+
+	collection := make([]Chirp, 0, len(records))
+	for _, r := range records {
+		collection = append(collection, NewChirpFromDB(r))
+	}
+
+	jason(w, 200, collection)
+}
+
+func (s *State) GetChirp(w http.ResponseWriter, r *http.Request) {
+	param := r.PathValue("id")
+	id, err := uuid.Parse(param)
+	if err != nil {
+		jason(w, 400, map[string]any{"error": "invalid user id"})
+		return
+	}
+
+	record, err := s.database.GetChirpByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(sql.ErrNoRows, err) {
+			jason(w, 404, map[string]any{"error": "not found"})
+			return
+		}
+
+		slog.Error("failed to get chirp by id", "err", err, "id", id)
+		w.WriteHeader(500)
+		return
+	}
+
+	jason(w, 200, NewChirpFromDB(record))
 }
 
 func jason(w http.ResponseWriter, code int, v any) {
