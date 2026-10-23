@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+	"github.com/lulzshadowwalker/chirpy/internal/auth"
 	"github.com/lulzshadowwalker/chirpy/internal/database"
 )
 
@@ -51,6 +52,7 @@ func main() {
 
 	mux.HandleFunc("GET /api/healthz", health)
 	mux.Handle("POST /api/users", chain.ThenFunc(state.CreateUser))
+	mux.Handle("POST /api/login", chain.ThenFunc(state.Login))
 	mux.Handle("POST /api/chirps", chain.ThenFunc(state.CreateChirp))
 	mux.Handle("GET /api/chirps", chain.ThenFunc(state.GetChirps))
 	mux.Handle("GET /api/chirps/{id}", chain.ThenFunc(state.GetChirp))
@@ -227,26 +229,121 @@ func NewChirpFromDB(c database.Chirp) Chirp {
 	}
 }
 
+type Validator interface {
+	Validate() map[string]string
+}
+
+func decode[T Validator](r *http.Request) (T, map[string]string, error) {
+	var v T
+	decoder := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&v); err != nil {
+		return v, nil, err
+	}
+
+	return v, v.Validate(), nil
+}
+
+type CreateUserRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+func (r CreateUserRequest) Validate() map[string]string {
+	issues := make(map[string]string)
+
+	// NOTE: Bob <bob@example.com> is a valid email when using `mail.ParseAddress`
+	if addr, err := mail.ParseAddress(r.Email); err != nil || addr.Address != r.Email {
+		issues["email"] = "must be a valid email address"
+	}
+
+	if len(r.Password) < 8 {
+		issues["password"] = "must be at least 8 characters"
+	}
+
+	return issues
+}
+
 func (s *State) CreateUser(w http.ResponseWriter, r *http.Request) {
-	var params struct {
-		Email string `json:"email"`
-	}
-
-	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(&params); err != nil {
-		jason(w, 400, map[string]any{"error": "something went wrong"})
+	v, issues, err := decode[CreateUserRequest](r)
+	if err != nil {
+		jason(w, 500, map[string]any{"error": "internal server error"})
 		return
 	}
 
-	if _, err := mail.ParseAddress(params.Email); err != nil {
-		jason(w, 400, map[string]any{"error": "invalid email address"})
+	if len(issues) != 0 {
+		jason(w, 400, issues)
 		return
 	}
 
-	u, err := s.database.CreateUser(r.Context(), params.Email)
+	// not the prettiest code ..
+	hash, err := auth.HashPassword(strings.TrimSpace(v.Password))
+	if err != nil {
+		jason(w, 500, map[string]any{"error": "internal server error"})
+		return
+	}
+
+	u, err := s.database.CreateUser(r.Context(), database.CreateUserParams{
+		Email:          strings.ToLower(v.Email),
+		HashedPassword: hash,
+	})
 	if err != nil {
 		slog.Error("failed to create user", "err", err)
 		w.WriteHeader(500)
+		return
+	}
+
+	jason(w, 201, NewUser(u))
+}
+
+type LoginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+func (r LoginRequest) Validate() map[string]string {
+	issues := make(map[string]string)
+
+	// NOTE: Bob <bob@example.com> is a valid email when using `mail.ParseAddress`
+	if addr, err := mail.ParseAddress(r.Email); err != nil || addr.Address != r.Email {
+		issues["email"] = "must be a valid email address"
+	}
+
+	if len(r.Password) < 8 {
+		issues["password"] = "must be at least 8 characters"
+	}
+
+	return issues
+}
+
+func (s *State) Login(w http.ResponseWriter, r *http.Request) {
+	v, issues, err := decode[LoginRequest](r)
+	if err != nil {
+		jason(w, 500, map[string]any{"error": "internal server error"})
+		return
+	}
+
+	if len(issues) != 0 {
+		jason(w, 400, issues)
+		return
+	}
+
+	u, err := s.database.GetUserByEmail(r.Context(), strings.ToLower(v.Email))
+	if err != nil {
+		jason(w, 500, map[string]any{"error": "internal server error"})
+		return
+	}
+
+	// not the prettiest code ..
+	ok, err := auth.CheckPasswordHash(strings.TrimSpace(v.Password), u.HashedPassword)
+	if err != nil {
+		jason(w, 500, map[string]any{"error": "internal server error"})
+		return
+	}
+
+	if !ok {
+		// prevent enumeration attack
+		jason(w, 500, map[string]any{"error": "internal server error"})
 		return
 	}
 

@@ -7,7 +7,7 @@ create table if not exists chirps (
     created_at timestamp not null default now(),
     updated_at timestamp not null default now(),
 
-    foreign key (user_id) references users(id)
+    foreign key (user_id) references users(id) on delete cascade
 );
 
 -- +goose Down
