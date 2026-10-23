@@ -42,7 +42,7 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	var state State
+	var state App
 	state.database = database.New(db)
 
 	chain := NewChain(logger, state.hit)
@@ -53,9 +53,9 @@ func main() {
 	mux.HandleFunc("GET /api/healthz", health)
 	mux.Handle("POST /api/users", chain.ThenFunc(state.CreateUser))
 	mux.Handle("POST /api/login", chain.ThenFunc(state.Login))
-	mux.Handle("POST /api/chirps", chain.ThenFunc(state.CreateChirp))
-	mux.Handle("GET /api/chirps", chain.ThenFunc(state.GetChirps))
-	mux.Handle("GET /api/chirps/{id}", chain.ThenFunc(state.GetChirp))
+	mux.Handle("POST /api/chirps", chain.ThenFunc(state.ChirpStore))
+	mux.Handle("GET /api/chirps", chain.ThenFunc(state.ChirpIndex))
+	mux.Handle("GET /api/chirps/{id}", chain.ThenFunc(state.ChirpShow))
 
 	mux.HandleFunc("GET /admin/metrics", state.Metrics)
 	mux.HandleFunc("POST /admin/reset", state.Reset)
@@ -76,19 +76,6 @@ func main() {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	<-ch
-}
-
-func health(w http.ResponseWriter, r *http.Request) {
-	w.Header().Add("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(200)
-	w.Write([]byte("OK"))
-}
-
-func logger(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		slog.Info("incoming request", "method", r.Method, "path", r.URL.Path)
-		next.ServeHTTP(w, r)
-	})
 }
 
 type Middleware func(next http.Handler) http.Handler
@@ -122,12 +109,25 @@ func (c Chain) ThenFunc(next http.HandlerFunc) http.Handler {
 	return c.Then(http.HandlerFunc(next))
 }
 
-type State struct {
+func health(w http.ResponseWriter, r *http.Request) {
+	w.Header().Add("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(200)
+	w.Write([]byte("OK"))
+}
+
+func logger(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		slog.Info("incoming request", "method", r.Method, "path", r.URL.Path)
+		next.ServeHTTP(w, r)
+	})
+}
+
+type App struct {
 	hits     atomic.Int32
 	database *database.Queries
 }
 
-func (s *State) Metrics(w http.ResponseWriter, r *http.Request) {
+func (a *App) Metrics(w http.ResponseWriter, r *http.Request) {
 	tpl, err := template.ParseFiles("app/metrics.html")
 	if err != nil {
 		w.WriteHeader(500)
@@ -136,7 +136,7 @@ func (s *State) Metrics(w http.ResponseWriter, r *http.Request) {
 
 	var buf bytes.Buffer
 	if err := tpl.Execute(&buf, map[string]any{
-		"Hits": s.hits.Load(),
+		"Hits": a.hits.Load(),
 	}); err != nil {
 		w.WriteHeader(500)
 		return
@@ -146,45 +146,28 @@ func (s *State) Metrics(w http.ResponseWriter, r *http.Request) {
 	buf.WriteTo(w)
 }
 
-func (s *State) hit(next http.Handler) http.Handler {
+func (a *App) hit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		s.hits.Add(1)
+		a.hits.Add(1)
 		next.ServeHTTP(w, r)
 	})
 }
 
-func (s *State) Reset(w http.ResponseWriter, r *http.Request) {
+func (a *App) Reset(w http.ResponseWriter, r *http.Request) {
 	if os.Getenv("APP_ENV") != "local" {
 		w.WriteHeader(403)
 		return
 	}
 
-	s.hits.Store(0)
+	a.hits.Store(0)
 
-	if err := s.database.DeleteUsers(r.Context()); err != nil {
+	if err := a.database.DeleteUsers(r.Context()); err != nil {
 		slog.Error("failed to delete users", "err", err)
 		w.WriteHeader(500)
 		return
 	}
 
 	http.Redirect(w, r, "/admin/metrics", http.StatusSeeOther)
-}
-
-var banned = map[string]struct{}{
-	"kerfuffle": {},
-	"sharbert":  {},
-	"fornax":    {},
-}
-
-func scrub(s string) string {
-	words := strings.Split(s, " ")
-	for i, word := range words {
-		if _, ok := banned[strings.ToLower(word)]; ok {
-			words[i] = "****"
-		}
-	}
-
-	return strings.Join(words, " ")
 }
 
 type User struct {
@@ -229,21 +212,6 @@ func NewChirpFromDB(c database.Chirp) Chirp {
 	}
 }
 
-type Validator interface {
-	Validate() map[string]string
-}
-
-func decode[T Validator](r *http.Request) (T, map[string]string, error) {
-	var v T
-	decoder := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&v); err != nil {
-		return v, nil, err
-	}
-
-	return v, v.Validate(), nil
-}
-
 type CreateUserRequest struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
@@ -264,26 +232,20 @@ func (r CreateUserRequest) Validate() map[string]string {
 	return issues
 }
 
-func (s *State) CreateUser(w http.ResponseWriter, r *http.Request) {
-	v, issues, err := decode[CreateUserRequest](r)
-	if err != nil {
-		jason(w, 500, map[string]any{"error": "internal server error"})
-		return
-	}
-
-	if len(issues) != 0 {
-		jason(w, 400, issues)
+func (a *App) CreateUser(w http.ResponseWriter, r *http.Request) {
+	v, ok := bind[CreateUserRequest](w, r)
+	if !ok {
 		return
 	}
 
 	// not the prettiest code ..
 	hash, err := auth.HashPassword(strings.TrimSpace(v.Password))
 	if err != nil {
-		jason(w, 500, map[string]any{"error": "internal server error"})
+		reply(w, 500, map[string]any{"error": "internal server error"})
 		return
 	}
 
-	u, err := s.database.CreateUser(r.Context(), database.CreateUserParams{
+	u, err := a.database.CreateUser(r.Context(), database.CreateUserParams{
 		Email:          strings.ToLower(v.Email),
 		HashedPassword: hash,
 	})
@@ -293,7 +255,7 @@ func (s *State) CreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jason(w, 201, NewUser(u))
+	reply(w, 201, NewUser(u))
 }
 
 type LoginRequest struct {
@@ -316,76 +278,77 @@ func (r LoginRequest) Validate() map[string]string {
 	return issues
 }
 
-func (s *State) Login(w http.ResponseWriter, r *http.Request) {
-	v, issues, err := decode[LoginRequest](r)
-	if err != nil {
-		jason(w, 500, map[string]any{"error": "internal server error"})
+func (a *App) Login(w http.ResponseWriter, r *http.Request) {
+	v, ok := bind[LoginRequest](w, r)
+	if !ok {
 		return
 	}
 
-	if len(issues) != 0 {
-		jason(w, 400, issues)
-		return
-	}
-
-	u, err := s.database.GetUserByEmail(r.Context(), strings.ToLower(v.Email))
+	u, err := a.database.GetUserByEmail(r.Context(), strings.ToLower(v.Email))
 	if err != nil {
-		jason(w, 500, map[string]any{"error": "internal server error"})
+		reply(w, 500, map[string]any{"error": "internal server error"})
 		return
 	}
 
 	// not the prettiest code ..
-	ok, err := auth.CheckPasswordHash(strings.TrimSpace(v.Password), u.HashedPassword)
+	ok, err = auth.CheckPasswordHash(strings.TrimSpace(v.Password), u.HashedPassword)
 	if err != nil {
-		jason(w, 500, map[string]any{"error": "internal server error"})
+		reply(w, 500, map[string]any{"error": "internal server error"})
 		return
 	}
 
 	if !ok {
 		// prevent enumeration attack
-		jason(w, 500, map[string]any{"error": "internal server error"})
+		reply(w, 500, map[string]any{"error": "internal server error"})
 		return
 	}
 
-	jason(w, 201, NewUser(u))
+	reply(w, 201, NewUser(u))
 }
 
-func (s *State) CreateChirp(w http.ResponseWriter, r *http.Request) {
-	var params struct {
-		Body   string `json:"body"`
-		UserID string `json:"user_id"`
-	}
+type CreateChirpRequest struct {
+	Body   string `json:"body"`
+	UserID string `json:"user_id"`
+}
 
-	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(&params); err != nil {
-		jason(w, 400, map[string]any{"error": "something went wrong"})
-		return
-	}
+func (r CreateChirpRequest) Validate() map[string]string {
+	issues := make(map[string]string)
 
-	e, err := NewChirp(params.Body)
+	_, err := NewChirp(r.Body)
 	if err != nil {
-		jason(w, 400, map[string]any{"error": "invalid email address"})
-		return
+		issues["email"] = "must be a valid email address"
 	}
 
-	uid, err := uuid.Parse(params.UserID)
+	_, err = uuid.Parse(r.UserID)
 	if err != nil {
-		jason(w, 400, map[string]any{"error": "invalid user id"})
+		issues["user_id"] = "must be a valid user id"
+	}
+
+	return issues
+}
+
+func (a *App) ChirpStore(w http.ResponseWriter, r *http.Request) {
+	v, ok := bind[CreateChirpRequest](w, r)
+	if !ok {
 		return
 	}
 
-	c, err := s.database.CreateChirp(r.Context(), database.CreateChirpParams{Body: e.Body, UserID: uid})
+	e, _ := NewChirp(v.Body)
+	c, err := a.database.CreateChirp(r.Context(), database.CreateChirpParams{
+		Body:   e.Body,
+		UserID: uuid.MustParse(v.UserID),
+	})
 	if err != nil {
 		slog.Error("failed to create chirp", "err", err)
 		w.WriteHeader(500)
 		return
 	}
 
-	jason(w, 201, NewChirpFromDB(c))
+	reply(w, 201, NewChirpFromDB(c))
 }
 
-func (s *State) GetChirps(w http.ResponseWriter, r *http.Request) {
-	records, err := s.database.GetChirps(r.Context())
+func (a *App) ChirpIndex(w http.ResponseWriter, r *http.Request) {
+	records, err := a.database.GetChirps(r.Context())
 	if err != nil {
 		slog.Error("failed to get chirps", "err", err)
 		w.WriteHeader(500)
@@ -397,21 +360,21 @@ func (s *State) GetChirps(w http.ResponseWriter, r *http.Request) {
 		collection = append(collection, NewChirpFromDB(r))
 	}
 
-	jason(w, 200, collection)
+	reply(w, 200, collection)
 }
 
-func (s *State) GetChirp(w http.ResponseWriter, r *http.Request) {
+func (a *App) ChirpShow(w http.ResponseWriter, r *http.Request) {
 	param := r.PathValue("id")
 	id, err := uuid.Parse(param)
 	if err != nil {
-		jason(w, 400, map[string]any{"error": "invalid user id"})
+		reply(w, 400, map[string]any{"error": "invalid user id"})
 		return
 	}
 
-	record, err := s.database.GetChirpByID(r.Context(), id)
+	record, err := a.database.GetChirpByID(r.Context(), id)
 	if err != nil {
 		if errors.Is(sql.ErrNoRows, err) {
-			jason(w, 404, map[string]any{"error": "not found"})
+			reply(w, 404, map[string]any{"error": "not found"})
 			return
 		}
 
@@ -420,10 +383,10 @@ func (s *State) GetChirp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jason(w, 200, NewChirpFromDB(record))
+	reply(w, 200, NewChirpFromDB(record))
 }
 
-func jason(w http.ResponseWriter, code int, v any) {
+func reply(w http.ResponseWriter, code int, v any) {
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(v); err != nil {
 		slog.Error("failed to encode response", "err", err)
@@ -434,4 +397,54 @@ func jason(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	buf.WriteTo(w)
+}
+
+func fail(w http.ResponseWriter, code int, msg string) {
+	reply(w, code, map[string]string{"error": msg})
+}
+
+type Validator interface {
+	Validate() map[string]string
+}
+
+func bind[T Validator](w http.ResponseWriter, r *http.Request) (T, bool) {
+	var v T
+
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+
+	if err := dec.Decode(&v); err != nil {
+		var big *http.MaxBytesError
+		if errors.As(err, &big) {
+			fail(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return v, false
+		}
+
+		fail(w, http.StatusBadRequest, "malformed request body")
+		return v, false
+	}
+
+	if issues := v.Validate(); len(issues) > 0 {
+		reply(w, http.StatusUnprocessableEntity, map[string]any{"errors": issues})
+		return v, false
+	}
+
+	return v, true
+}
+
+var banned = map[string]struct{}{
+	"kerfuffle": {},
+	"sharbert":  {},
+	"fornax":    {},
+}
+
+func scrub(s string) string {
+	words := strings.Split(s, " ")
+	for i, word := range words {
+		if _, ok := banned[strings.ToLower(word)]; ok {
+			words[i] = "****"
+		}
+	}
+
+	return strings.Join(words, " ")
 }
