@@ -1,6 +1,7 @@
 package main
 
 import (
+	"slices"
 	"bytes"
 	"database/sql"
 	"encoding/json"
@@ -64,6 +65,7 @@ func main() {
 	mux.Handle("POST /api/chirps", chain.ThenFunc(state.ChirpStore))
 	mux.Handle("GET /api/chirps", chain.ThenFunc(state.ChirpIndex))
 	mux.Handle("GET /api/chirps/{id}", chain.ThenFunc(state.ChirpShow))
+	mux.Handle("DELETE /api/chirps/{id}", chain.ThenFunc(state.ChirpDelete))
 
 	mux.HandleFunc("GET /admin/metrics", state.Metrics)
 	mux.HandleFunc("POST /admin/reset", state.Reset)
@@ -102,8 +104,8 @@ func (c Chain) Then(next http.Handler) http.Handler {
 	}
 
 	// reverse order such that the first middleware passed in is executed first
-	for i := len(c.Middlewares) - 1; i >= 0; i-- {
-		next = c.Middlewares[i](next)
+	for _, v := range slices.Backward(c.Middlewares) {
+		next = v(next)
 	}
 
 	return next
@@ -496,7 +498,7 @@ func (a *App) ChirpShow(w http.ResponseWriter, r *http.Request) {
 	param := r.PathValue("id")
 	id, err := uuid.Parse(param)
 	if err != nil {
-		reply(w, 400, map[string]any{"error": "invalid user id"})
+		reply(w, 400, map[string]any{"error": "invalid chirp id"})
 		return
 	}
 
@@ -513,6 +515,53 @@ func (a *App) ChirpShow(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reply(w, 200, NewChirpFromDB(record))
+}
+
+func (a *App) ChirpDelete(w http.ResponseWriter, r *http.Request) {
+	bearer, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		fail(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	userID, err := auth.ValidateJWT(bearer, a.secret)
+	if err != nil {
+		fail(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	param := r.PathValue("id")
+	id, err := uuid.Parse(param)
+	if err != nil {
+		reply(w, 400, map[string]any{"error": "invalid chirp id"})
+		return
+	}
+
+	record, err := a.database.GetChirpByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(sql.ErrNoRows, err) {
+			reply(w, 404, map[string]any{"error": "not found"})
+			return
+		}
+
+		slog.Error("failed to get chirp by id", "err", err, "id", id)
+		w.WriteHeader(500)
+		return
+	}
+
+	if record.UserID != userID {
+		fail(w, http.StatusForbidden, "forbidden")
+		return
+	}
+
+	err = a.database.DeleteChirp(r.Context(), id)
+	if err != nil {
+		slog.Error("failed to delete chirp", "err", err, "id", id)
+		w.WriteHeader(500)
+		return
+	}
+
+	reply(w, 204, nil)
 }
 
 func reply(w http.ResponseWriter, code int, v any) {
@@ -543,8 +592,7 @@ func bind[T Validator](w http.ResponseWriter, r *http.Request) (T, bool) {
 	dec.DisallowUnknownFields()
 
 	if err := dec.Decode(&v); err != nil {
-		var big *http.MaxBytesError
-		if errors.As(err, &big) {
+		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 			fail(w, http.StatusRequestEntityTooLarge, "request body too large")
 			return v, false
 		}
