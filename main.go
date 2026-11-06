@@ -44,6 +44,11 @@ func main() {
 
 	var state App
 	state.database = database.New(db)
+	state.secret = os.Getenv("APP_SECRET")
+	if state.secret == "" {
+		slog.Error("APP_SECRET is not set")
+		os.Exit(1)
+	}
 
 	chain := NewChain(logger, state.hit)
 
@@ -52,7 +57,10 @@ func main() {
 
 	mux.HandleFunc("GET /api/healthz", health)
 	mux.Handle("POST /api/users", chain.ThenFunc(state.CreateUser))
+	mux.Handle("PUT /api/users", chain.ThenFunc(state.UpdateUser))
 	mux.Handle("POST /api/login", chain.ThenFunc(state.Login))
+	mux.Handle("POST /api/refresh", chain.ThenFunc(state.RefreshToken))
+	mux.Handle("POST /api/revoke", chain.ThenFunc(state.RevokeToken))
 	mux.Handle("POST /api/chirps", chain.ThenFunc(state.ChirpStore))
 	mux.Handle("GET /api/chirps", chain.ThenFunc(state.ChirpIndex))
 	mux.Handle("GET /api/chirps/{id}", chain.ThenFunc(state.ChirpShow))
@@ -123,6 +131,7 @@ func logger(next http.Handler) http.Handler {
 }
 
 type App struct {
+	secret   string
 	hits     atomic.Int32
 	database *database.Queries
 }
@@ -258,6 +267,47 @@ func (a *App) CreateUser(w http.ResponseWriter, r *http.Request) {
 	reply(w, 201, NewUser(u))
 }
 
+type UpdateUserRequest = CreateUserRequest
+
+func (a *App) UpdateUser(w http.ResponseWriter, r *http.Request) {
+	bearer, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		fail(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	userID, err := auth.ValidateJWT(bearer, a.secret)
+	if err != nil {
+		fail(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	v, ok := bind[UpdateUserRequest](w, r)
+	if !ok {
+		return
+	}
+
+	// not the prettiest code ..
+	hash, err := auth.HashPassword(strings.TrimSpace(v.Password))
+	if err != nil {
+		reply(w, 500, map[string]any{"error": "internal server error"})
+		return
+	}
+
+	u, err := a.database.UpdateUser(r.Context(), database.UpdateUserParams{
+		ID:             userID,
+		Email:          strings.ToLower(v.Email),
+		HashedPassword: hash,
+	})
+	if err != nil {
+		slog.Error("failed to update user", "err", err)
+		w.WriteHeader(500)
+		return
+	}
+
+	reply(w, 201, NewUser(u))
+}
+
 type LoginRequest struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
@@ -303,12 +353,84 @@ func (a *App) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reply(w, 201, NewUser(u))
+	token, err := auth.MakeJWT(u.ID, a.secret, time.Hour)
+	if err != nil {
+		reply(w, 500, map[string]any{"error": "internal server error"})
+		return
+	}
+
+	refreshToken := auth.MakeRefreshToken()
+
+	_, err = a.database.CreateRefreshToken(r.Context(), database.CreateRefreshTokenParams{
+		UserID:    u.ID,
+		Token:     refreshToken,
+		ExpiresAt: time.Now().UTC().Add(time.Hour * 24 * 60),
+	})
+	if err != nil {
+		reply(w, 500, map[string]any{"error": "internal server error"})
+		return
+	}
+
+	reply(w, 200, struct {
+		User
+		Token        string `json:"token"`
+		RefreshToken string `json:"refresh_token"`
+	}{NewUser(u), token, refreshToken})
+}
+
+func (a *App) RefreshToken(w http.ResponseWriter, r *http.Request) {
+	bearer, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		fail(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	user, err := a.database.GetUserFromRefreshToken(r.Context(), bearer)
+	if err != nil {
+		fail(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	accessToken, err := auth.MakeJWT(user.ID, a.secret, time.Hour)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+
+	reply(w, 200, struct {
+		Token string `json:"token"`
+	}{accessToken})
+}
+
+func (a *App) RevokeToken(w http.ResponseWriter, r *http.Request) {
+	bearer, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		fail(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	_, err = a.database.GetRefreshToken(r.Context(), bearer)
+	if err != nil {
+		fail(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	now := time.Now().UTC()
+	_, err = a.database.UpdateRefreshToken(r.Context(), database.UpdateRefreshTokenParams{
+		RevokedAt: sql.NullTime{Time: now, Valid: true},
+		UpdatedAt: now,
+	})
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+
+	reply(w, 204, nil)
 }
 
 type CreateChirpRequest struct {
 	Body   string `json:"body"`
-	UserID string `json:"user_id"`
+	UserID string `json:"user_id,omitempty"` // ignored; the user comes from the JWT
 }
 
 func (r CreateChirpRequest) Validate() map[string]string {
@@ -319,15 +441,22 @@ func (r CreateChirpRequest) Validate() map[string]string {
 		issues["email"] = "must be a valid email address"
 	}
 
-	_, err = uuid.Parse(r.UserID)
-	if err != nil {
-		issues["user_id"] = "must be a valid user id"
-	}
-
 	return issues
 }
 
 func (a *App) ChirpStore(w http.ResponseWriter, r *http.Request) {
+	bearer, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		fail(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	userID, err := auth.ValidateJWT(bearer, a.secret)
+	if err != nil {
+		fail(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
 	v, ok := bind[CreateChirpRequest](w, r)
 	if !ok {
 		return
@@ -336,7 +465,7 @@ func (a *App) ChirpStore(w http.ResponseWriter, r *http.Request) {
 	e, _ := NewChirp(v.Body)
 	c, err := a.database.CreateChirp(r.Context(), database.CreateChirpParams{
 		Body:   e.Body,
-		UserID: uuid.MustParse(v.UserID),
+		UserID: userID,
 	})
 	if err != nil {
 		slog.Error("failed to create chirp", "err", err)

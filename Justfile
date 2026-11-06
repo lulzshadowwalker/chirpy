@@ -27,3 +27,6 @@ migrate-fresh:
 
 migrate-create name:
     goose --dir {{ MIGRATIONS_DIR }} create {{ name }} sql
+
+sqlc:
+    sqlc generate
