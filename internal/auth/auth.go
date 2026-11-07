@@ -44,3 +44,22 @@ func MakeRefreshToken() string {
 
 	return hex.EncodeToString(buf)
 }
+
+func GetAPIKey(headers http.Header) (string, error) {
+	h := strings.TrimSpace(headers.Get("Authorization"))
+	if h == "" {
+		return "", errors.New("missing authorization header")
+	}
+
+	scheme, key, ok := strings.Cut(h, " ")
+	if !ok || scheme != "ApiKey" {
+		return "", errors.New("malformed authorization header")
+	}
+
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "", errors.New("missing api key")
+	}
+
+	return key, nil
+}

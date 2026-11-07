@@ -16,3 +16,13 @@ delete from users;
 -- name: GetUserByEmail :one
 select * from users
 where email = $1;
+
+-- name: GetUserByID :one
+select * from users
+where id = $1;
+
+-- name: MarkChirpyRed :one
+update users 
+set is_chirpy_red = true
+where id = $1
+returning *;

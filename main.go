@@ -1,7 +1,6 @@
 package main
 
 import (
-	"slices"
 	"bytes"
 	"database/sql"
 	"encoding/json"
@@ -12,6 +11,7 @@ import (
 	"net/mail"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -50,6 +50,7 @@ func main() {
 		slog.Error("APP_SECRET is not set")
 		os.Exit(1)
 	}
+	state.polkaKey = os.Getenv("POLKA_API_KEY")
 
 	chain := NewChain(logger, state.hit)
 
@@ -66,6 +67,7 @@ func main() {
 	mux.Handle("GET /api/chirps", chain.ThenFunc(state.ChirpIndex))
 	mux.Handle("GET /api/chirps/{id}", chain.ThenFunc(state.ChirpShow))
 	mux.Handle("DELETE /api/chirps/{id}", chain.ThenFunc(state.ChirpDelete))
+	mux.Handle("POST /api/polka/webhooks", chain.ThenFunc(state.PolkaWebhook))
 
 	mux.HandleFunc("GET /admin/metrics", state.Metrics)
 	mux.HandleFunc("POST /admin/reset", state.Reset)
@@ -134,6 +136,7 @@ func logger(next http.Handler) http.Handler {
 
 type App struct {
 	secret   string
+	polkaKey string
 	hits     atomic.Int32
 	database *database.Queries
 }
@@ -182,18 +185,20 @@ func (a *App) Reset(w http.ResponseWriter, r *http.Request) {
 }
 
 type User struct {
-	ID        uuid.UUID `json:"id"`
-	Email     string    `json:"email"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID          uuid.UUID `json:"id"`
+	Email       string    `json:"email"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	IsChirpyRed bool      `json:"is_chirpy_red"`
 }
 
 func NewUser(u database.User) User {
 	return User{
-		ID:        u.ID,
-		Email:     u.Email,
-		CreatedAt: u.CreatedAt,
-		UpdatedAt: u.UpdatedAt,
+		ID:          u.ID,
+		Email:       u.Email,
+		CreatedAt:   u.CreatedAt,
+		UpdatedAt:   u.UpdatedAt,
+		IsChirpyRed: u.IsChirpyRed,
 	}
 }
 
@@ -564,7 +569,52 @@ func (a *App) ChirpDelete(w http.ResponseWriter, r *http.Request) {
 	reply(w, 204, nil)
 }
 
+type PolkaWebhookRequest struct {
+	Event string `json:"event"`
+	Data  struct {
+		UserID uuid.UUID `json:"user_id"`
+	} `json:"data"`
+}
+
+func (a *App) PolkaWebhook(w http.ResponseWriter, r *http.Request) {
+	apiKey, err := auth.GetAPIKey(r.Header)
+	if err != nil || apiKey != a.polkaKey {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	var req PolkaWebhookRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	if req.Event != "user.upgraded" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	_, err = a.database.MarkChirpyRed(r.Context(), req.Data.UserID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		slog.Error("failed to upgrade user to chirpy red", "err", err, "id", req.Data.UserID)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func reply(w http.ResponseWriter, code int, v any) {
+	if code == http.StatusNoContent {
+		w.WriteHeader(code)
+		return
+	}
+
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(v); err != nil {
 		slog.Error("failed to encode response", "err", err)
